@@ -1,0 +1,1077 @@
+diff --git a/codex-rs/config/src/types.rs b/codex-rs/config/src/types.rs
+index e459f95..c40385c 100644
+--- a/codex-rs/config/src/types.rs
++++ b/codex-rs/config/src/types.rs
+@@ -720,6 +720,14 @@ pub struct Tui {
+     #[serde(default)]
+     pub status_line: Option<Vec<String>>,
+ 
++    /// Command used to render the TUI status line.
++    ///
++    /// When set, this command receives a JSON status payload on stdin and its stdout replaces the
++    /// built-in `status_line` item renderer. ANSI color/style escapes and explicit newlines are
++    /// preserved by the TUI.
++    #[serde(default)]
++    pub status_line_command: Option<TuiStatusLineCommand>,
++
+     /// Color status line items with colors derived from the active syntax theme.
+     /// Defaults to `true`.
+     #[serde(default = "default_true")]
+@@ -776,6 +784,29 @@ pub struct Tui {
+     pub terminal_resize_reflow_max_rows: Option<usize>,
+ }
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
++#[schemars(deny_unknown_fields)]
++pub struct TuiStatusLineCommand {
++    /// Shell command to execute for the status line.
++    pub command: String,
++
++    /// Minimum delay between command executions in milliseconds.
++    #[serde(default = "default_status_line_command_refresh_interval_ms")]
++    pub refresh_interval_ms: u64,
++
++    /// Maximum time to wait for the command before keeping the previous output.
++    #[serde(default = "default_status_line_command_timeout_ms")]
++    pub timeout_ms: u64,
++}
++
++const fn default_status_line_command_refresh_interval_ms() -> u64 {
++    1000
++}
++
++const fn default_status_line_command_timeout_ms() -> u64 {
++    1000
++}
++
+ const fn default_true() -> bool {
+     true
+ }
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 904018e..b4d233f 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -742,6 +742,7 @@ fn config_toml_deserializes_model_availability_nux() {
+             raw_output_mode: false,
+             alternate_screen: AltScreenMode::default(),
+             status_line: None,
++            status_line_command: None,
+             status_line_use_colors: true,
+             terminal_title: None,
+             theme: None,
+@@ -3576,6 +3577,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
+             raw_output_mode: false,
+             alternate_screen: AltScreenMode::Auto,
+             status_line: None,
++            status_line_command: None,
+             status_line_use_colors: true,
+             terminal_title: None,
+             theme: None,
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 8e9ccc6..e48b89a 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -52,6 +52,7 @@ use codex_config::types::ToolSuggestDiscoverable;
+ use codex_config::types::TuiKeymap;
+ use codex_config::types::TuiNotificationSettings;
+ use codex_config::types::TuiPetAnchor;
++use codex_config::types::TuiStatusLineCommand;
+ use codex_config::types::UriBasedFileOpener;
+ use codex_config::types::WindowsSandboxModeToml;
+ use codex_core_plugins::PluginsConfigInput;
+@@ -756,6 +757,9 @@ pub struct Config {
+     /// When unset, the TUI defaults to: `model-with-reasoning` and `current-dir`.
+     pub tui_status_line: Option<Vec<String>>,
+ 
++    /// Command-backed status line renderer for the TUI.
++    pub tui_status_line_command: Option<TuiStatusLineCommand>,
++
+     /// Whether to color status line items with colors from the active syntax theme.
+     pub tui_status_line_use_colors: bool,
+ 
+@@ -3875,6 +3879,10 @@ impl Config {
+                 .map(|t| t.alternate_screen)
+                 .unwrap_or_default(),
+             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
++            tui_status_line_command: cfg
++                .tui
++                .as_ref()
++                .and_then(|t| t.status_line_command.clone()),
+             tui_status_line_use_colors: cfg
+                 .tui
+                 .as_ref()
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+index b9796a5..6bb2eba 100644
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -208,6 +208,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
+         model_availability_nux: ModelAvailabilityNuxConfig::default(),
+         tui_alternate_screen: AltScreenMode::Auto,
+         tui_status_line: None,
++        tui_status_line_command: None,
+         tui_status_line_use_colors: true,
+         tui_terminal_title: None,
+         tui_theme: None,
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 16e4aaa..4d6593c 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2010,6 +2010,15 @@ impl App {
+                 self.chat_widget.set_status_line_git_summary(cwd, summary);
+                 self.refresh_status_line();
+             }
++            AppEvent::StatusLineCommandCompleted { request_id, output } => {
++                self.chat_widget
++                    .set_status_line_command_output(request_id, output);
++                self.refresh_status_line();
++            }
++            AppEvent::StatusLineCommandTick => {
++                self.chat_widget.on_status_line_command_tick();
++                self.refresh_status_line();
++            }
+             AppEvent::StatusLineSetupCancelled => {
+                 self.chat_widget.cancel_status_line_setup();
+             }
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 1143848..3d061a4 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -977,6 +977,13 @@ pub(crate) enum AppEvent {
+         cwd: PathBuf,
+         summary: crate::chatwidget::StatusLineGitSummary,
+     },
++    /// Async completion of a command-backed status-line render.
++    StatusLineCommandCompleted {
++        request_id: u64,
++        output: Option<String>,
++    },
++    /// Timer event used to refresh command-backed status lines without waiting for input.
++    StatusLineCommandTick,
+     /// Apply a user-confirmed status-line item ordering/selection.
+     StatusLineSetup {
+         items: Vec<StatusLineItem>,
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index 2423647..4f5e8c7 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -174,11 +174,12 @@ use super::footer::footer_hint_items_width;
+ use super::footer::footer_line_width;
+ use super::footer::inset_footer_hint_area;
+ use super::footer::max_left_width_for_right;
+-use super::footer::passive_footer_status_line;
++use super::footer::passive_footer_status_lines;
+ use super::footer::render_context_right;
+ use super::footer::render_footer_from_props;
+ use super::footer::render_footer_hint_items;
+ use super::footer::render_footer_line;
++use super::footer::render_footer_lines;
+ use super::footer::reset_mode_after_activity;
+ use super::footer::side_conversation_context_line;
+ use super::footer::single_line_footer_layout;
+@@ -3911,6 +3912,13 @@ impl ChatComposer {
+     }
+ 
+     pub(crate) fn set_status_line(&mut self, status_line: Option<Line<'static>>) -> bool {
++        self.set_status_line_lines(status_line.map(|line| vec![line]))
++    }
++
++    pub(crate) fn set_status_line_lines(
++        &mut self,
++        status_line: Option<Vec<Line<'static>>>,
++    ) -> bool {
+         if self.footer.status_line_value == status_line {
+             return false;
+         }
+@@ -4206,48 +4214,71 @@ impl ChatComposer {
+                     let available_width =
+                         hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+                     let status_line_active = uses_passive_footer_status_layout(&footer_props);
+-                    let combined_status_line = if status_line_active {
+-                        passive_footer_status_line(&footer_props)
+-                    } else {
+-                        None
+-                    };
+-                    let mut truncated_status_line = if status_line_active {
+-                        combined_status_line.as_ref().map(|line| {
+-                            truncate_line_with_ellipsis_if_overflow(line.clone(), available_width)
+-                        })
++                    let combined_status_lines = if status_line_active {
++                        passive_footer_status_lines(&footer_props)
+                     } else {
+                         None
+                     };
+-                    let left_mode_indicator = if status_line_active {
+-                        None
+-                    } else {
+-                        self.footer.collaboration_mode_indicator
+-                    };
+-                    let active_footer_hint_override = self.footer.hint_override.as_ref();
+-                    let mut left_width = if self.footer.flash_visible() {
+-                        self.footer
+-                            .flash
+-                            .as_ref()
+-                            .map(|flash| flash.line.width() as u16)
+-                            .unwrap_or(0)
+-                    } else if let Some(items) = active_footer_hint_override {
+-                        footer_hint_items_width(items)
+-                    } else if status_line_active {
+-                        truncated_status_line
+-                            .as_ref()
+-                            .map(|line| line.width() as u16)
+-                            .unwrap_or(0)
++                    let rendered_multiline_status = if let Some(lines) = combined_status_lines
++                        .as_ref()
++                        .filter(|lines| lines.len() > 1)
++                    {
++                        let lines = lines
++                            .iter()
++                            .cloned()
++                            .map(|line| {
++                                truncate_line_with_ellipsis_if_overflow(line, available_width)
++                            })
++                            .collect();
++                        render_footer_lines(hint_rect, buf, lines);
++                        true
+                     } else {
+-                        footer_line_width(
+-                            &footer_props,
+-                            left_mode_indicator,
+-                            show_cycle_hint,
+-                            show_shortcuts_hint,
+-                            show_queue_hint,
+-                        )
++                        false
+                     };
+-                    let right_line =
+-                        if let Some(label) = self.footer.side_conversation_context_label.as_ref() {
++                    if !rendered_multiline_status {
++                        let combined_status_line =
++                            combined_status_lines.and_then(|mut lines| lines.pop());
++                        let mut truncated_status_line = if status_line_active {
++                            combined_status_line.as_ref().map(|line| {
++                                truncate_line_with_ellipsis_if_overflow(
++                                    line.clone(),
++                                    available_width,
++                                )
++                            })
++                        } else {
++                            None
++                        };
++                        let left_mode_indicator = if status_line_active {
++                            None
++                        } else {
++                            self.footer.collaboration_mode_indicator
++                        };
++                        let active_footer_hint_override = self.footer.hint_override.as_ref();
++                        let mut left_width = if self.footer.flash_visible() {
++                            self.footer
++                                .flash
++                                .as_ref()
++                                .map(|flash| flash.line.width() as u16)
++                                .unwrap_or(0)
++                        } else if let Some(items) = active_footer_hint_override {
++                            footer_hint_items_width(items)
++                        } else if status_line_active {
++                            truncated_status_line
++                                .as_ref()
++                                .map(|line| line.width() as u16)
++                                .unwrap_or(0)
++                        } else {
++                            footer_line_width(
++                                &footer_props,
++                                left_mode_indicator,
++                                show_cycle_hint,
++                                show_shortcuts_hint,
++                                show_queue_hint,
++                            )
++                        };
++                        let right_line = if let Some(label) =
++                            self.footer.side_conversation_context_label.as_ref()
++                        {
+                             Some(side_conversation_context_line(label))
+                         } else if let Some(line) = self.shell_mode_footer_line() {
+                             Some(line)
+@@ -4263,67 +4294,82 @@ impl ChatComposer {
+                         } else {
+                             Some(self.right_footer_line_with_context())
+                         };
+-                    let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
+-                    if status_line_active
+-                        && let Some(max_left) = max_left_width_for_right(hint_rect, right_width)
+-                        && left_width > max_left
+-                        && let Some(line) = combined_status_line.as_ref().map(|line| {
+-                            truncate_line_with_ellipsis_if_overflow(line.clone(), max_left as usize)
+-                        })
+-                    {
+-                        left_width = line.width() as u16;
+-                        truncated_status_line = Some(line);
+-                    }
+-                    let can_show_left_and_context =
+-                        can_show_left_with_context(hint_rect, left_width, right_width);
+-                    let has_override =
+-                        self.footer.flash_visible() || active_footer_hint_override.is_some();
+-                    let single_line_layout = if has_override || status_line_active {
+-                        None
+-                    } else {
+-                        match footer_props.mode {
+-                            FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft => {
+-                                // Both of these modes render the single-line footer style (with
+-                                // either the shortcuts hint or the optional queue hint). We still
+-                                // want the single-line collapse rules so the mode label can win over
+-                                // the context indicator on narrow widths.
+-                                Some(single_line_footer_layout(
+-                                    hint_rect,
+-                                    right_width,
+-                                    left_mode_indicator,
+-                                    show_cycle_hint,
+-                                    show_shortcuts_hint,
+-                                    show_queue_hint,
+-                                    footer_props.key_hints,
+-                                ))
++                        let right_width =
++                            right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
++                        if status_line_active
++                            && let Some(max_left) = max_left_width_for_right(hint_rect, right_width)
++                            && left_width > max_left
++                            && let Some(line) = combined_status_line.as_ref().map(|line| {
++                                truncate_line_with_ellipsis_if_overflow(
++                                    line.clone(),
++                                    max_left as usize,
++                                )
++                            })
++                        {
++                            left_width = line.width() as u16;
++                            truncated_status_line = Some(line);
++                        }
++                        let can_show_left_and_context =
++                            can_show_left_with_context(hint_rect, left_width, right_width);
++                        let has_override =
++                            self.footer.flash_visible() || active_footer_hint_override.is_some();
++                        let single_line_layout = if has_override || status_line_active {
++                            None
++                        } else {
++                            match footer_props.mode {
++                                FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft => {
++                                    // Both of these modes render the single-line footer style (with
++                                    // either the shortcuts hint or the optional queue hint). We still
++                                    // want the single-line collapse rules so the mode label can win over
++                                    // the context indicator on narrow widths.
++                                    Some(single_line_footer_layout(
++                                        hint_rect,
++                                        right_width,
++                                        left_mode_indicator,
++                                        show_cycle_hint,
++                                        show_shortcuts_hint,
++                                        show_queue_hint,
++                                        footer_props.key_hints,
++                                    ))
++                                }
++                                FooterMode::EscHint
++                                | FooterMode::HistorySearch
++                                | FooterMode::QuitShortcutReminder
++                                | FooterMode::ShortcutOverlay => None,
+                             }
++                        };
++                        let show_right = if matches!(
++                            footer_props.mode,
+                             FooterMode::EscHint
+-                            | FooterMode::HistorySearch
+-                            | FooterMode::QuitShortcutReminder
+-                            | FooterMode::ShortcutOverlay => None,
+-                        }
+-                    };
+-                    let show_right = if matches!(
+-                        footer_props.mode,
+-                        FooterMode::EscHint
+-                            | FooterMode::HistorySearch
+-                            | FooterMode::QuitShortcutReminder
+-                            | FooterMode::ShortcutOverlay
+-                    ) {
+-                        false
+-                    } else {
+-                        single_line_layout
+-                            .as_ref()
+-                            .map(|(_, show_context)| *show_context)
+-                            .unwrap_or(can_show_left_and_context)
+-                    };
++                                | FooterMode::HistorySearch
++                                | FooterMode::QuitShortcutReminder
++                                | FooterMode::ShortcutOverlay
++                        ) {
++                            false
++                        } else {
++                            single_line_layout
++                                .as_ref()
++                                .map(|(_, show_context)| *show_context)
++                                .unwrap_or(can_show_left_and_context)
++                        };
+ 
+-                    if let Some((summary_left, _)) = single_line_layout {
+-                        match summary_left {
+-                            SummaryLeft::Default => {
+-                                if status_line_active {
+-                                    if let Some(line) = truncated_status_line.clone() {
+-                                        render_footer_line(hint_rect, buf, line);
++                        if let Some((summary_left, _)) = single_line_layout {
++                            match summary_left {
++                                SummaryLeft::Default => {
++                                    if status_line_active {
++                                        if let Some(line) = truncated_status_line.clone() {
++                                            render_footer_line(hint_rect, buf, line);
++                                        } else {
++                                            render_footer_from_props(
++                                                hint_rect,
++                                                buf,
++                                                &footer_props,
++                                                left_mode_indicator,
++                                                show_cycle_hint,
++                                                show_shortcuts_hint,
++                                                show_queue_hint,
++                                            );
++                                        }
+                                     } else {
+                                         render_footer_from_props(
+                                             hint_rect,
+@@ -4335,51 +4381,41 @@ impl ChatComposer {
+                                             show_queue_hint,
+                                         );
+                                     }
+-                                } else {
+-                                    render_footer_from_props(
+-                                        hint_rect,
+-                                        buf,
+-                                        &footer_props,
+-                                        left_mode_indicator,
+-                                        show_cycle_hint,
+-                                        show_shortcuts_hint,
+-                                        show_queue_hint,
+-                                    );
+                                 }
++                                SummaryLeft::Custom(line) => {
++                                    render_footer_line(hint_rect, buf, line);
++                                }
++                                SummaryLeft::None => {}
++                            }
++                        } else if self.footer.flash_visible() {
++                            if let Some(flash) = self.footer.flash.as_ref() {
++                                flash.line.render(inset_footer_hint_area(hint_rect), buf);
+                             }
+-                            SummaryLeft::Custom(line) => {
++                        } else if let Some(items) = active_footer_hint_override {
++                            render_footer_hint_items(hint_rect, buf, items);
++                        } else if status_line_active {
++                            if let Some(line) = truncated_status_line {
+                                 render_footer_line(hint_rect, buf, line);
+                             }
+-                            SummaryLeft::None => {}
++                        } else {
++                            render_footer_from_props(
++                                hint_rect,
++                                buf,
++                                &footer_props,
++                                self.footer.collaboration_mode_indicator,
++                                show_cycle_hint,
++                                show_shortcuts_hint,
++                                show_queue_hint,
++                            );
+                         }
+-                    } else if self.footer.flash_visible() {
+-                        if let Some(flash) = self.footer.flash.as_ref() {
+-                            flash.line.render(inset_footer_hint_area(hint_rect), buf);
++                        if show_right && let Some(line) = &right_line {
++                            render_context_right(hint_rect, buf, line);
+                         }
+-                    } else if let Some(items) = active_footer_hint_override {
+-                        render_footer_hint_items(hint_rect, buf, items);
+-                    } else if status_line_active {
+-                        if let Some(line) = truncated_status_line {
+-                            render_footer_line(hint_rect, buf, line);
++                        if status_line_active
++                            && let Some(url) = self.footer.status_line_hyperlink_url.as_deref()
++                        {
++                            mark_underlined_hyperlink(buf, hint_rect, url);
+                         }
+-                    } else {
+-                        render_footer_from_props(
+-                            hint_rect,
+-                            buf,
+-                            &footer_props,
+-                            self.footer.collaboration_mode_indicator,
+-                            show_cycle_hint,
+-                            show_shortcuts_hint,
+-                            show_queue_hint,
+-                        );
+-                    }
+-                    if show_right && let Some(line) = &right_line {
+-                        render_context_right(hint_rect, buf, line);
+-                    }
+-                    if status_line_active
+-                        && let Some(url) = self.footer.status_line_hyperlink_url.as_deref()
+-                    {
+-                        mark_underlined_hyperlink(buf, hint_rect, url);
+                     }
+                 }
+             }
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+index 113385f..4d94a30 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+@@ -25,7 +25,7 @@ pub(super) struct FooterState {
+     pub(super) collaboration_mode_indicator: Option<CollaborationModeIndicator>,
+     pub(super) goal_status_indicator: Option<GoalStatusIndicator>,
+     pub(super) ide_context_active: bool,
+-    pub(super) status_line_value: Option<Line<'static>>,
++    pub(super) status_line_value: Option<Vec<Line<'static>>>,
+     pub(super) status_line_hyperlink_url: Option<String>,
+     pub(super) status_line_enabled: bool,
+     pub(super) side_conversation_context_label: Option<String>,
+@@ -63,11 +63,17 @@ impl FooterState {
+ 
+     #[cfg(test)]
+     pub(super) fn status_line_text(&self) -> Option<String> {
+-        self.status_line_value.as_ref().map(|line| {
+-            line.spans
++        self.status_line_value.as_ref().map(|lines| {
++            lines
+                 .iter()
+-                .map(|span| span.content.as_ref())
+-                .collect::<String>()
++                .map(|line| {
++                    line.spans
++                        .iter()
++                        .map(|span| span.content.as_ref())
++                        .collect::<String>()
++                })
++                .collect::<Vec<_>>()
++                .join("\n")
+         })
+     }
+ }
+diff --git a/codex-rs/tui/src/bottom_pane/footer.rs b/codex-rs/tui/src/bottom_pane/footer.rs
+index e11534a..0ca0625 100644
+--- a/codex-rs/tui/src/bottom_pane/footer.rs
++++ b/codex-rs/tui/src/bottom_pane/footer.rs
+@@ -75,7 +75,7 @@ pub(crate) struct FooterProps {
+     ///
+     /// This is rendered when `mode` is `FooterMode::QuitShortcutReminder`.
+     pub(crate) quit_shortcut_key: KeyBinding,
+-    pub(crate) status_line_value: Option<Line<'static>>,
++    pub(crate) status_line_value: Option<Vec<Line<'static>>>,
+     pub(crate) status_line_enabled: bool,
+     pub(crate) key_hints: FooterKeyHints,
+     /// Active thread label shown when the footer is rendering contextual information instead of an
+@@ -256,8 +256,13 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
+ 
+ /// Render a single precomputed footer line.
+ pub(crate) fn render_footer_line(area: Rect, buf: &mut Buffer, line: Line<'static>) {
++    render_footer_lines(area, buf, vec![line]);
++}
++
++/// Render precomputed footer lines.
++pub(crate) fn render_footer_lines(area: Rect, buf: &mut Buffer, lines: Vec<Line<'static>>) {
+     Paragraph::new(prefix_lines(
+-        vec![line],
++        lines,
+         " ".repeat(FOOTER_INDENT_COLS).into(),
+         " ".repeat(FOOTER_INDENT_COLS).into(),
+     ))
+@@ -716,8 +721,8 @@ fn footer_from_props_lines(
+     let key_hints = props.key_hints;
+     // Passive footer context can come from the configurable status line, the
+     // active agent label, or both combined.
+-    if let Some(status_line) = passive_footer_status_line(props) {
+-        return vec![status_line];
++    if let Some(status_lines) = passive_footer_status_lines(props) {
++        return status_lines;
+     }
+     match props.mode {
+         FooterMode::QuitShortcutReminder => {
+@@ -777,27 +782,38 @@ fn footer_from_props_lines(
+ /// The returned line may contain the configured status line, the currently viewed agent label, or
+ /// both combined. Active instructional states such as quit reminders, shortcut overlays, and queue
+ /// prompts deliberately return `None` so those call-to-action hints stay visible.
++#[cfg(test)]
+ pub(crate) fn passive_footer_status_line(props: &FooterProps) -> Option<Line<'static>> {
++    passive_footer_status_lines(props).and_then(|mut lines| {
++        if lines.is_empty() {
++            None
++        } else {
++            Some(lines.remove(0))
++        }
++    })
++}
++
++pub(crate) fn passive_footer_status_lines(props: &FooterProps) -> Option<Vec<Line<'static>>> {
+     if !shows_passive_footer_line(props) {
+         return None;
+     }
+ 
+-    let mut line = if props.status_line_enabled {
++    let mut lines = if props.status_line_enabled {
+         props.status_line_value.clone()
+     } else {
+         None
+     };
+ 
+     if let Some(active_agent_label) = props.active_agent_label.as_ref() {
+-        if let Some(existing) = line.as_mut() {
++        if let Some(existing) = lines.as_mut().and_then(|lines| lines.last_mut()) {
+             existing.spans.push(" · ".dim());
+             existing.spans.push(active_agent_label.clone().dim());
+         } else {
+-            line = Some(Line::from(active_agent_label.clone()).dim());
++            lines = Some(vec![Line::from(active_agent_label.clone()).dim()]);
+         }
+     }
+ 
+-    line
++    lines.filter(|lines| !lines.is_empty())
+ }
+ 
+ /// Whether the current footer mode allows contextual information to replace instructional hints.
+@@ -1819,7 +1835,7 @@ mod tests {
+             collaboration_modes_enabled: false,
+             is_wsl: false,
+             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+-            status_line_value: Some(Line::from("Status line content".to_string())),
++            status_line_value: Some(vec![Line::from("Status line content".to_string())]),
+             status_line_enabled: true,
+             key_hints: FooterKeyHints::default_bindings(),
+             active_agent_label: None,
+@@ -1836,7 +1852,7 @@ mod tests {
+             collaboration_modes_enabled: false,
+             is_wsl: false,
+             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+-            status_line_value: Some(Line::from("Status line content".to_string())),
++            status_line_value: Some(vec![Line::from("Status line content".to_string())]),
+             status_line_enabled: true,
+             key_hints: FooterKeyHints::default_bindings(),
+             active_agent_label: None,
+@@ -1853,7 +1869,7 @@ mod tests {
+             collaboration_modes_enabled: false,
+             is_wsl: false,
+             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+-            status_line_value: Some(Line::from("Status line content".to_string())),
++            status_line_value: Some(vec![Line::from("Status line content".to_string())]),
+             status_line_enabled: true,
+             key_hints: FooterKeyHints::default_bindings(),
+             active_agent_label: None,
+@@ -1948,9 +1964,9 @@ mod tests {
+             collaboration_modes_enabled: true,
+             is_wsl: false,
+             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+-            status_line_value: Some(Line::from(
++            status_line_value: Some(vec![Line::from(
+                 "Status line content that should truncate before the mode indicator".to_string(),
+-            )),
++            )]),
+             status_line_enabled: true,
+             key_hints: FooterKeyHints::default_bindings(),
+             active_agent_label: None,
+@@ -1990,7 +2006,7 @@ mod tests {
+             collaboration_modes_enabled: false,
+             is_wsl: false,
+             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+-            status_line_value: Some(Line::from("Status line content".to_string())),
++            status_line_value: Some(vec![Line::from("Status line content".to_string())]),
+             status_line_enabled: true,
+             key_hints: FooterKeyHints::default_bindings(),
+             active_agent_label: Some("Robie [explorer]".to_string()),
+@@ -2010,10 +2026,10 @@ mod tests {
+             collaboration_modes_enabled: true,
+             is_wsl: false,
+             quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+-            status_line_value: Some(Line::from(
++            status_line_value: Some(vec![Line::from(
+                 "Status line content that is definitely too long to fit alongside the mode label"
+                     .to_string(),
+-            )),
++            )]),
+             status_line_enabled: true,
+             key_hints: FooterKeyHints::default_bindings(),
+             active_agent_label: None,
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 7fffdeb..4ab469d 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -1766,6 +1766,12 @@ impl BottomPane {
+         }
+     }
+ 
++    pub(crate) fn set_status_line_lines(&mut self, status_line: Option<Vec<Line<'static>>>) {
++        if self.composer.set_status_line_lines(status_line) {
++            self.request_redraw();
++        }
++    }
++
+     pub(crate) fn set_status_line_hyperlink(&mut self, url: Option<String>) {
+         if self.composer.set_status_line_hyperlink(url) {
+             self.request_redraw();
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index fd3c140..466f28f 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -727,6 +727,16 @@ pub(crate) struct ChatWidget {
+     status_line_git_summary_pending: bool,
+     // True once we've attempted a Git summary lookup for the current CWD.
+     status_line_git_summary_lookup_complete: bool,
++    // Cached output from a command-backed status line.
++    status_line_command_output: Option<Vec<Line<'static>>>,
++    // True while a command-backed status-line render is in flight.
++    status_line_command_pending: bool,
++    // Monotonic request id for dropping stale command-backed status-line completions.
++    status_line_command_request_id: u64,
++    // Last time a command-backed status-line render started.
++    status_line_command_last_started_at: Option<Instant>,
++    // True while a periodic command-backed status-line tick is scheduled.
++    status_line_command_tick_pending: bool,
+     // Current thread-goal status shown in the status line when plan mode is inactive.
+     current_goal_status_indicator: Option<GoalStatusIndicator>,
+     current_goal_status: Option<GoalStatusState>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 77fdd74..7782ef2 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -229,6 +229,11 @@ impl ChatWidget {
+             status_line_git_summary_cwd: None,
+             status_line_git_summary_pending: false,
+             status_line_git_summary_lookup_complete: false,
++            status_line_command_output: None,
++            status_line_command_pending: false,
++            status_line_command_request_id: 0,
++            status_line_command_last_started_at: None,
++            status_line_command_tick_pending: false,
+             current_goal_status_indicator: None,
+             current_goal_status: None,
+             external_editor_state: ExternalEditorState::Closed,
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+index d4de738..67608f0 100644
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -69,6 +69,11 @@ impl ChatWidget {
+         self.bottom_pane.set_status_line(status_line);
+     }
+ 
++    /// Sets the currently rendered footer status-line value as multiple lines.
++    pub(crate) fn set_status_line_lines(&mut self, status_line: Option<Vec<Line<'static>>>) {
++        self.bottom_pane.set_status_line_lines(status_line);
++    }
++
+     /// Sets the terminal hyperlink target for the currently rendered footer status line.
+     pub(crate) fn set_status_line_hyperlink(&mut self, url: Option<String>) {
+         self.bottom_pane.set_status_line_hyperlink(url);
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 592dd04..db12c48 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -11,10 +11,16 @@ use crate::chatwidget::rate_limits::get_limits_duration;
+ use crate::legacy_core::config::Config;
+ use crate::status::format_tokens_compact;
+ use codex_app_server_protocol::AskForApproval;
++use codex_config::types::TuiStatusLineCommand;
+ use codex_protocol::config_types::ApprovalsReviewer;
+ use codex_protocol::config_types::ServiceTier;
+ use codex_protocol::models::PermissionProfile;
+ use codex_utils_sandbox_summary::summarize_permission_profile;
++use serde_json::json;
++use std::process::Stdio;
++use tokio::io::AsyncWriteExt;
++use tokio::process::Command;
++use tokio::time::timeout;
+ 
+ use super::status_state::TerminalTitleStatusKind;
+ 
+@@ -31,6 +37,11 @@ pub(super) const TERMINAL_TITLE_SPINNER_INTERVAL: Duration = Duration::from_mill
+ 
+ /// Time between action-required blink phases in the terminal title.
+ const TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL: Duration = Duration::from_secs(1);
++const STATUS_LINE_COMMAND_MAX_LINES: usize = 4;
++const STATUS_LINE_COMMAND_MAX_OUTPUT_CHARS: usize = 8192;
++const STATUS_LINE_COMMAND_MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
++const STATUS_LINE_COMMAND_DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
++const STATUS_LINE_COMMAND_DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
+ 
+ /// Prefix shown in the terminal title when the agent is blocked on user input.
+ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX: &str = "[ ! ] Action Required";
+@@ -134,7 +145,9 @@ impl ChatWidget {
+     }
+ 
+     fn sync_status_surface_shared_state(&mut self, selections: &StatusSurfaceSelections) {
+-        if !selections.uses_git_branch() {
++        let uses_git_branch =
++            self.status_line_command_config().is_some() || selections.uses_git_branch();
++        if !uses_git_branch {
+             self.status_line_branch = None;
+             self.status_line_branch_pending = false;
+             self.status_line_branch_lookup_complete = false;
+@@ -160,6 +173,15 @@ impl ChatWidget {
+     }
+ 
+     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
++        if self.status_line_command_config().is_some() {
++            self.bottom_pane.set_status_line_enabled(true);
++            self.set_status_line_hyperlink(/*url*/ None);
++            self.request_status_line_command_refresh_if_due();
++            self.schedule_status_line_command_tick();
++            self.set_status_line_lines(self.status_line_command_output.clone());
++            return;
++        }
++
+         let enabled = !selections.status_line_items.is_empty();
+         self.bottom_pane.set_status_line_enabled(enabled);
+         if !enabled {
+@@ -187,6 +209,142 @@ impl ChatWidget {
+         self.set_status_line_hyperlink(hyperlink_url);
+     }
+ 
++    fn status_line_command_config(&self) -> Option<&TuiStatusLineCommand> {
++        self.config
++            .tui_status_line_command
++            .as_ref()
++            .filter(|config| !config.command.trim().is_empty())
++    }
++
++    fn request_status_line_command_refresh_if_due(&mut self) {
++        let Some(config) = self.status_line_command_config().cloned() else {
++            return;
++        };
++        if self.status_line_command_pending {
++            return;
++        }
++
++        let now = Instant::now();
++        let refresh_interval = status_line_command_refresh_interval(&config);
++        if self
++            .status_line_command_last_started_at
++            .is_some_and(|started_at| now.saturating_duration_since(started_at) < refresh_interval)
++        {
++            return;
++        }
++
++        self.status_line_command_pending = true;
++        self.status_line_command_last_started_at = Some(now);
++        self.status_line_command_request_id = self.status_line_command_request_id.saturating_add(1);
++        let request_id = self.status_line_command_request_id;
++        let payload = self.status_line_command_payload();
++        let cwd = self.status_line_cwd().to_path_buf();
++        let tx = self.app_event_tx.clone();
++        tokio::spawn(async move {
++            let output = run_status_line_command(config, cwd, payload).await;
++            tx.send(AppEvent::StatusLineCommandCompleted { request_id, output });
++        });
++    }
++
++    fn schedule_status_line_command_tick(&mut self) {
++        if self.status_line_command_tick_pending {
++            return;
++        }
++        let Some(delay) = self
++            .status_line_command_config()
++            .map(status_line_command_refresh_interval)
++        else {
++            return;
++        };
++        self.status_line_command_tick_pending = true;
++        let tx = self.app_event_tx.clone();
++        tokio::spawn(async move {
++            tokio::time::sleep(delay).await;
++            tx.send(AppEvent::StatusLineCommandTick);
++        });
++    }
++
++    pub(crate) fn on_status_line_command_tick(&mut self) {
++        self.status_line_command_tick_pending = false;
++    }
++
++    pub(crate) fn set_status_line_command_output(
++        &mut self,
++        request_id: u64,
++        output: Option<String>,
++    ) {
++        if request_id != self.status_line_command_request_id {
++            return;
++        }
++        self.status_line_command_pending = false;
++        if let Some(output) = output {
++            self.status_line_command_output = status_line_command_output_lines(&output);
++        }
++        self.refresh_status_surfaces();
++    }
++
++    fn status_line_command_payload(&mut self) -> String {
++        let model_id = self.current_model().to_string();
++        let model_display = self.model_display_name().to_string();
++        let model_with_reasoning = self.model_with_reasoning_display_name();
++        let reasoning = self.reasoning_display_name();
++        let cwd = self.status_line_cwd().to_string_lossy().to_string();
++        let project = self.status_line_project_root_name();
++        let total_usage = self.status_line_total_usage();
++        let context_used_percent = self.status_line_context_used_percent();
++        let context_remaining_percent = self.status_line_context_remaining_percent();
++        let context_window_tokens = self.status_line_context_window_size();
++        let five_hour_limit = self.status_line_value_for_item(StatusLineItem::FiveHourLimit);
++        let weekly_limit = self.status_line_value_for_item(StatusLineItem::WeeklyLimit);
++
++        json!({
++            "version": 1,
++            "width": self.last_rendered_width.get(),
++            "cwd": cwd,
++            "project": project,
++            "session": {
++                "id": self.thread_id.as_ref().map(ToString::to_string),
++                "title": self.thread_name.clone(),
++            },
++            "model": {
++                "id": model_id,
++                "display": model_display,
++                "with_reasoning": model_with_reasoning,
++            },
++            "reasoning": {
++                "effort": reasoning,
++            },
++            "git": {
++                "branch": self.status_line_branch.clone(),
++            },
++            "context": {
++                "used_percent": context_used_percent,
++                "remaining_percent": context_remaining_percent,
++                "window_tokens": context_window_tokens,
++            },
++            "tokens": {
++                "used": total_usage.blended_total(),
++                "input": total_usage.input_tokens,
++                "cached_input": total_usage.cached_input_tokens,
++                "output": total_usage.output_tokens,
++                "reasoning_output": total_usage.reasoning_output_tokens,
++                "total": total_usage.total_tokens,
++            },
++            "limits": {
++                "five_hour": {
++                    "text": five_hour_limit,
++                },
++                "weekly": {
++                    "text": weekly_limit,
++                },
++            },
++            "status": {
++                "state": self.run_state_status_text(),
++            },
++        })
++        .to_string()
++    }
++
+     /// Clears the terminal title Codex most recently wrote, if any.
+     ///
+     /// This does not attempt to restore the shell or terminal's previous title;
+@@ -996,6 +1154,111 @@ fn matches_window_label(window: &RateLimitWindowDisplay, label: &str) -> bool {
+         == Some(label)
+ }
+ 
++fn status_line_command_refresh_interval(config: &TuiStatusLineCommand) -> Duration {
++    if config.refresh_interval_ms == 0 {
++        STATUS_LINE_COMMAND_DEFAULT_REFRESH_INTERVAL
++    } else {
++        Duration::from_millis(config.refresh_interval_ms)
++            .max(STATUS_LINE_COMMAND_MIN_REFRESH_INTERVAL)
++    }
++}
++
++fn status_line_command_timeout(config: &TuiStatusLineCommand) -> Duration {
++    if config.timeout_ms == 0 {
++        STATUS_LINE_COMMAND_DEFAULT_TIMEOUT
++    } else {
++        Duration::from_millis(config.timeout_ms)
++    }
++}
++
++fn status_line_command_output_lines(output: &str) -> Option<Vec<Line<'static>>> {
++    let output = output.trim_end_matches(['\r', '\n']);
++    if output.trim().is_empty() {
++        return None;
++    }
++
++    let text = codex_ansi_escape::ansi_escape(output);
++    let lines = text
++        .lines
++        .into_iter()
++        .take(STATUS_LINE_COMMAND_MAX_LINES)
++        .collect::<Vec<_>>();
++    (!lines.is_empty()).then_some(lines)
++}
++
++async fn run_status_line_command(
++    config: TuiStatusLineCommand,
++    cwd: PathBuf,
++    payload: String,
++) -> Option<String> {
++    let timeout_duration = status_line_command_timeout(&config);
++    let mut command = status_line_shell_command(&config.command);
++    command
++        .current_dir(cwd)
++        .env("CODEX_STATUS_LINE", "1")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .kill_on_drop(true);
++
++    let mut child = match command.spawn() {
++        Ok(child) => child,
++        Err(err) => {
++            tracing::debug!(error = %err, "failed to spawn status-line command");
++            return None;
++        }
++    };
++
++    if let Some(mut stdin) = child.stdin.take() {
++        tokio::spawn(async move {
++            let _ = stdin.write_all(payload.as_bytes()).await;
++        });
++    }
++
++    let output = match timeout(timeout_duration, child.wait_with_output()).await {
++        Ok(Ok(output)) => output,
++        Ok(Err(err)) => {
++            tracing::debug!(error = %err, "failed to wait for status-line command");
++            return None;
++        }
++        Err(_) => {
++            tracing::debug!("status-line command timed out");
++            return None;
++        }
++    };
++
++    if !output.status.success() {
++        tracing::debug!(
++            status = ?output.status.code(),
++            "status-line command exited unsuccessfully"
++        );
++        return None;
++    }
++
++    Some(
++        String::from_utf8_lossy(&output.stdout)
++            .chars()
++            .take(STATUS_LINE_COMMAND_MAX_OUTPUT_CHARS)
++            .collect(),
++    )
++}
++
++fn status_line_shell_command(command_text: &str) -> Command {
++    #[cfg(target_os = "windows")]
++    {
++        let mut command = Command::new("cmd");
++        command.arg("/C").arg(command_text);
++        command
++    }
++
++    #[cfg(not(target_os = "windows"))]
++    {
++        let mut command = Command::new("sh");
++        command.arg("-c").arg(command_text);
++        command
++    }
++}
++
+ fn permissions_display(config: &Config) -> String {
+     let active_permission_profile = config.permissions.active_permission_profile();
+     if let Some(active_permission_profile) = active_permission_profile.as_ref()

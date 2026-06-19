@@ -3,42 +3,58 @@ set -euo pipefail
 
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CONFIG_PATH="${CODEX_CONFIG_PATH:-$CODEX_HOME/config.toml}"
-PRESET="${STATUSLINE_PRESET:-full}"
-
-case "$PRESET" in
-  full)
-    DEFAULT_ITEMS="model-with-reasoning,git-branch,context-used,five-hour-limit,weekly-limit"
-    ;;
-  compact)
-    DEFAULT_ITEMS="model-with-reasoning,context-remaining,git-branch"
-    ;;
-  tokens)
-    DEFAULT_ITEMS="model-with-reasoning,git-branch,context-used,used-tokens,total-input-tokens,total-output-tokens"
-    ;;
-  all)
-    DEFAULT_ITEMS="model-with-reasoning,git-branch,context-used,context-remaining,five-hour-limit,weekly-limit,used-tokens,total-input-tokens,total-output-tokens,thread-id,task-progress,current-dir"
-    ;;
-  *)
-    echo "Error: unknown STATUSLINE_PRESET '$PRESET'." >&2
-    echo "Valid presets: full, compact, tokens, all" >&2
-    exit 1
-    ;;
-esac
-
-ITEMS="${STATUSLINE_ITEMS:-${CODEX_STATUS_LINE:-$DEFAULT_ITEMS}}"
+SCRIPT_DEST="${STATUSLINE_SCRIPT_PATH:-$CODEX_HOME/statusline-command.sh}"
+REFRESH_INTERVAL_MS="${STATUSLINE_REFRESH_INTERVAL_MS:-1000}"
+TIMEOUT_MS="${STATUSLINE_TIMEOUT_MS:-1000}"
+FORCE="${CODEX_STATUS_LINE_FORCE:-0}"
+RAW_BASE_URL="${CODEX_STATUS_LINE_RAW_BASE_URL:-https://raw.githubusercontent.com/matheustimbo/codex-status-line/main}"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Error: python3 is required to safely update config.toml." >&2
   exit 1
 fi
 
-python3 - "$CONFIG_PATH" "$ITEMS" <<'PY'
+if [ "$FORCE" != "1" ] && command -v codex >/dev/null 2>&1; then
+  codex_bin="$(command -v codex)"
+  if ! strings "$codex_bin" 2>/dev/null | grep -q "status_line_command"; then
+    cat >&2 <<'EOF'
+Error: this Codex binary does not appear to support tui.status_line_command.
+
+Apply patches/codex-status-line-command.patch to Codex CLI and install that build first,
+or rerun with CODEX_STATUS_LINE_FORCE=1 if you know your binary is patched.
+EOF
+    exit 1
+  fi
+fi
+
+mkdir -p "$CODEX_HOME"
+
+script_source=""
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -f "$script_dir/statusline-command.sh" ]; then
+    script_source="$script_dir/statusline-command.sh"
+  fi
+fi
+
+if [ -n "$script_source" ]; then
+  cp "$script_source" "$SCRIPT_DEST"
+else
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is required when install.sh is run without a local statusline-command.sh." >&2
+    exit 1
+  fi
+  curl -fsSL "$RAW_BASE_URL/statusline-command.sh" -o "$SCRIPT_DEST"
+fi
+chmod 755 "$SCRIPT_DEST"
+
+python3 - "$CONFIG_PATH" "$SCRIPT_DEST" "$REFRESH_INTERVAL_MS" "$TIMEOUT_MS" <<'PY'
 from __future__ import annotations
 
 import datetime as dt
 import json
 import pathlib
-import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -49,41 +65,14 @@ except ModuleNotFoundError:
     tomllib = None
 
 config_path = pathlib.Path(sys.argv[1]).expanduser()
-items = [item.strip() for item in sys.argv[2].split(",") if item.strip()]
+script_path = pathlib.Path(sys.argv[2]).expanduser()
+refresh_interval_ms = int(sys.argv[3])
+timeout_ms = int(sys.argv[4])
 
-known_items = {
-    "model-with-reasoning",
-    "model",
-    "reasoning",
-    "git-branch",
-    "git",
-    "context-used",
-    "context-remaining",
-    "five-hour-limit",
-    "weekly-limit",
-    "used-tokens",
-    "total-input-tokens",
-    "total-output-tokens",
-    "thread-id",
-    "task-progress",
-    "current-dir",
-    "run-state",
-    "thread-title",
-    "codex-version",
-}
-
-if not items:
-    raise SystemExit("Error: no status-line items configured.")
-
-unknown = [item for item in items if item not in known_items]
-if unknown:
-    valid = ", ".join(sorted(known_items))
-    raise SystemExit(
-        "Error: unknown status-line item(s): "
-        + ", ".join(unknown)
-        + "\nValid items: "
-        + valid
-    )
+if refresh_interval_ms < 250:
+    raise SystemExit("Error: STATUSLINE_REFRESH_INTERVAL_MS must be at least 250.")
+if timeout_ms < 1:
+    raise SystemExit("Error: STATUSLINE_TIMEOUT_MS must be positive.")
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 old_text = config_path.read_text() if config_path.exists() else ""
@@ -94,58 +83,35 @@ if tomllib is not None:
     except tomllib.TOMLDecodeError as exc:
         raise SystemExit(f"Error: {config_path} is not valid TOML: {exc}") from exc
 
-new_setting = "status_line = [" + ", ".join(json.dumps(item) for item in items) + "]\n"
 lines = old_text.splitlines(keepends=True)
+new_lines: list[str] = []
+skip = False
+for line in lines:
+    stripped = line.strip()
+    if stripped == "[tui.status_line_command]":
+        skip = True
+        continue
+    if skip and stripped.startswith("[") and stripped.endswith("]"):
+        skip = False
+    if not skip:
+        new_lines.append(line)
 
-table_re = re.compile(r"^\s*\[[^\]]+\]\s*(?:#.*)?$")
-tui_re = re.compile(r"^\s*\[tui\]\s*(?:#.*)?$")
-setting_re = re.compile(r"^\s*status_line\s*=")
+if new_lines and not new_lines[-1].endswith("\n"):
+    new_lines[-1] += "\n"
+if new_lines and new_lines[-1].strip():
+    new_lines.append("\n")
 
-tui_index = next((i for i, line in enumerate(lines) if tui_re.match(line)), None)
+command = "bash " + shlex.quote(str(script_path))
+new_lines.extend(
+    [
+        "[tui.status_line_command]\n",
+        f"command = {json.dumps(command)}\n",
+        f"refresh_interval_ms = {refresh_interval_ms}\n",
+        f"timeout_ms = {timeout_ms}\n",
+    ]
+)
 
-def find_table_end(start: int) -> int:
-    for index in range(start, len(lines)):
-        if table_re.match(lines[index]):
-            return index
-    return len(lines)
-
-def find_setting_end(start: int) -> int:
-    balance = 0
-    saw_array = False
-    for index in range(start, len(lines)):
-        line = lines[index]
-        balance += line.count("[") - line.count("]")
-        saw_array = saw_array or "[" in line
-        if not saw_array or balance <= 0:
-            return index + 1
-    return start + 1
-
-if tui_index is None:
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
-    if lines and lines[-1].strip():
-        lines.append("\n")
-    lines.extend(["[tui]\n", new_setting])
-else:
-    section_start = tui_index + 1
-    section_end = find_table_end(section_start)
-    setting_index = next(
-        (i for i in range(section_start, section_end) if setting_re.match(lines[i])),
-        None,
-    )
-    if setting_index is None:
-        insert_at = section_end
-        if insert_at > section_start and lines[insert_at - 1].strip():
-            lines.insert(insert_at, "\n")
-            insert_at += 1
-        lines.insert(insert_at, new_setting)
-        if insert_at + 1 < len(lines) and table_re.match(lines[insert_at + 1]):
-            lines.insert(insert_at + 1, "\n")
-    else:
-        setting_end = find_setting_end(setting_index)
-        lines[setting_index:setting_end] = [new_setting]
-
-new_text = "".join(lines)
+new_text = "".join(new_lines)
 if tomllib is not None:
     tomllib.loads(new_text)
 
@@ -167,8 +133,8 @@ tmp_path.replace(config_path)
 print(f"Updated {config_path}")
 if backup_path:
     print(f"Backup: {backup_path}")
-print("Status line:", ", ".join(items))
+print(f"Installed command: {command}")
 PY
 
 echo
-echo "Done. Restart Codex CLI, or run /statusline inside Codex to adjust interactively."
+echo "Done. Restart a patched Codex CLI to see the command-backed status line."

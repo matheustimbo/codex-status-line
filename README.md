@@ -1,115 +1,81 @@
-<div align="center">
-
 # codex-status-line
 
-**A small status-line installer for [Codex CLI](https://developers.openai.com/codex)** — keep model, reasoning, git branch, context, and Codex usage limits visible in the terminal footer.
+Claude-style status line for Codex CLI.
 
-[![One-line install](https://img.shields.io/badge/install-one%20line-brightgreen)](#one-line-install)
-[![Codex CLI](https://img.shields.io/badge/Codex-CLI-blue)](https://developers.openai.com/codex)
-[![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
-[![PT-BR](https://img.shields.io/badge/language-PT--BR-green)](README.pt-BR.md)
+Current public Codex CLI renders `tui.status_line` as a native one-line list of item IDs. To match Claude Code behavior, this repo ships two pieces:
 
-**EN** · [PT-BR](README.pt-BR.md)
+- `patches/codex-status-line-command.patch`: a Codex TUI patch that adds `[tui.status_line_command]`.
+- `statusline-command.sh`: an external renderer that receives JSON on stdin, emits ANSI, and can output multiple lines.
 
-</div>
+## Install
 
----
+1. Apply the patch to Codex source:
 
-Codex CLI already has a native TUI footer. This repo configures that footer by setting `tui.status_line` in `~/.codex/config.toml`.
+```bash
+git clone https://github.com/openai/codex.git
+cd codex
+git apply /Users/matheustimbo/Documents/codex-status-line/patches/codex-status-line-command.patch
+cd codex-rs
+cargo build -p codex-cli --bin codex --release
+```
 
-Default layout:
+2. Put the patched binary first in `PATH`:
+
+```bash
+export PATH="$PWD/target/release:$PATH"
+```
+
+3. Install the status line:
+
+```bash
+bash /Users/matheustimbo/Documents/codex-status-line/install.sh
+```
+
+The installer copies `statusline-command.sh` to `~/.codex/statusline-command.sh` and appends:
 
 ```toml
-[tui]
-status_line = ["model-with-reasoning", "git-branch", "context-used", "five-hour-limit", "weekly-limit"]
+[tui.status_line_command]
+command = "bash ~/.codex/statusline-command.sh"
+refresh_interval_ms = 1000
+timeout_ms = 1000
 ```
 
-That gives you the Codex equivalent of the original Claude status line:
+It backs up `~/.codex/config.toml` before changing an existing file.
 
-- active model and reasoning effort
-- current git branch
-- context usage
-- 5-hour usage limit
-- weekly usage limit
+## Options
 
-No API calls, no background process, no custom renderer. Codex renders the footer with its own TUI styling.
-
-## Requirements
-
-- Codex CLI with `tui.status_line` support
-- `bash`
-- `python3`
-
-## One-Line Install
+Configure display with environment variables:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/matheustimbo/codex-status-line/main/install.sh | bash
+SHOW_LIMITS=0 SHOW_SESSION=1 STATUSLINE_SEP=" | " bash ~/.codex/statusline-command.sh
 ```
 
-Then restart Codex CLI. You can also adjust the footer interactively with `/statusline`.
+Supported options:
 
-The installer preserves your existing `~/.codex/config.toml`, updates only `tui.status_line`, and writes a timestamped backup before changing an existing file.
+- `SHOW_MODEL=0|1`
+- `SHOW_GIT=0|1`
+- `SHOW_CONTEXT=0|1`
+- `SHOW_LIMITS=0|1`
+- `SHOW_SESSION=0|1`
+- `STATUSLINE_SEP=" · "`
+- `STATUSLINE_MAX_WIDTH=120`
+- `STATUSLINE_REFRESH_INTERVAL_MS=1000`
+- `STATUSLINE_TIMEOUT_MS=1000`
 
-## Presets
+## Safety
 
-Use `STATUSLINE_PRESET` to choose a layout:
+`install.sh` checks whether the local `codex` binary appears to contain `status_line_command` support. If not, it exits before editing config so an unpatched Codex install is not broken.
+
+Use `CODEX_STATUS_LINE_FORCE=1 bash install.sh` only when you know your Codex binary is patched.
+
+## Local Validation
 
 ```bash
-STATUSLINE_PRESET=compact curl -fsSL https://raw.githubusercontent.com/matheustimbo/codex-status-line/main/install.sh | bash
+bash -n install.sh
+bash -n statusline-command.sh
 ```
 
-| Preset | Items |
-| --- | --- |
-| `full` | `model-with-reasoning`, `git-branch`, `context-used`, `five-hour-limit`, `weekly-limit` |
-| `compact` | `model-with-reasoning`, `context-remaining`, `git-branch` |
-| `tokens` | `model-with-reasoning`, `git-branch`, `context-used`, `used-tokens`, `total-input-tokens`, `total-output-tokens` |
-| `all` | model, git, context, limits, token counters, thread, task progress, current dir |
-
-## Custom Layout
-
-Set `STATUSLINE_ITEMS` to an explicit comma-separated list:
-
-```bash
-STATUSLINE_ITEMS="model-with-reasoning,git-branch,context-remaining,used-tokens" bash install.sh
-```
-
-Known item IDs:
-
-```text
-model-with-reasoning
-model
-reasoning
-git-branch
-git
-context-used
-context-remaining
-five-hour-limit
-weekly-limit
-used-tokens
-total-input-tokens
-total-output-tokens
-thread-id
-task-progress
-current-dir
-run-state
-thread-title
-codex-version
-```
-
-## Manual Install
-
-Edit `~/.codex/config.toml`:
-
-```toml
-[tui]
-status_line = ["model-with-reasoning", "git-branch", "context-used", "five-hour-limit", "weekly-limit"]
-```
-
-Restart Codex CLI.
-
-## Claude Code Difference
-
-Claude Code status lines run an external command that receives JSON on stdin. Codex CLI uses native footer item IDs in `config.toml`. This repo intentionally configures the native Codex footer instead of emulating Claude's command contract.
+Rust compile-check was not run in this environment because `cargo` was not installed in `PATH`.
 
 ## License
 
