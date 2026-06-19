@@ -62,6 +62,8 @@ Supported options:
 - `STATUSLINE_REFRESH_INTERVAL_MS=1000`
 - `STATUSLINE_TIMEOUT_MS=1000`
 
+Limit items include reset times when Codex has them in the rate-limit snapshot.
+
 ## Safety
 
 `install.sh` checks whether the local `codex` binary appears to contain `status_line_command` support. If not, it exits before editing config so an unpatched Codex install is not broken.

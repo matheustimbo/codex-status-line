@@ -745,7 +745,7 @@ index 77fdd74..7782ef2 100644
              current_goal_status: None,
              external_editor_state: ExternalEditorState::Closed,
 diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
-index d4de738..67608f0 100644
+index d4de738..979271e 100644
 --- a/codex-rs/tui/src/chatwidget/status_controls.rs
 +++ b/codex-rs/tui/src/chatwidget/status_controls.rs
 @@ -69,6 +69,11 @@ impl ChatWidget {
@@ -760,11 +760,50 @@ index d4de738..67608f0 100644
      /// Sets the terminal hyperlink target for the currently rendered footer status line.
      pub(crate) fn set_status_line_hyperlink(&mut self, url: Option<String>) {
          self.bottom_pane.set_status_line_hyperlink(url);
+@@ -377,8 +382,7 @@ impl ChatWidget {
+         label: &str,
+     ) -> Option<String> {
+         let window = window?;
+-        let remaining = (100.0f64 - window.used_percent).clamp(0.0f64, 100.0f64);
+-        Some(format!("{label} {remaining:.0}% left"))
++        Some(status_line_limit_display_text(window, label))
+     }
+ 
+     pub(super) fn status_line_reasoning_effort_label(
+@@ -390,3 +394,20 @@ impl ChatWidget {
+         }
+     }
+ }
++
++pub(super) fn status_line_limit_display_text(
++    window: &RateLimitWindowDisplay,
++    label: &str,
++) -> String {
++    let remaining = status_line_limit_remaining_percent(window);
++    let reset = window
++        .resets_at
++        .as_deref()
++        .map(|resets_at| format!(" (resets {resets_at})"))
++        .unwrap_or_default();
++    format!("{label} {remaining:.0}% left{reset}")
++}
++
++pub(super) fn status_line_limit_remaining_percent(window: &RateLimitWindowDisplay) -> f64 {
++    (100.0f64 - window.used_percent).clamp(0.0f64, 100.0f64)
++}
 diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index 592dd04..db12c48 100644
+index 592dd04..1162803 100644
 --- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
 +++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -11,10 +11,16 @@ use crate::chatwidget::rate_limits::get_limits_duration;
+@@ -3,6 +3,7 @@
+ //! Keeping this logic in a focused submodule makes the additive title/status
+ //! behavior easier to review without paging through the rest of `chatwidget.rs`.
+ 
++use super::status_controls::{status_line_limit_display_text, status_line_limit_remaining_percent};
+ use super::*;
+ use crate::bottom_pane::status_line_from_segments;
+ use crate::branch_summary;
+@@ -11,10 +12,16 @@ use crate::chatwidget::rate_limits::get_limits_duration;
  use crate::legacy_core::config::Config;
  use crate::status::format_tokens_compact;
  use codex_app_server_protocol::AskForApproval;
@@ -781,7 +820,7 @@ index 592dd04..db12c48 100644
  
  use super::status_state::TerminalTitleStatusKind;
  
-@@ -31,6 +37,11 @@ pub(super) const TERMINAL_TITLE_SPINNER_INTERVAL: Duration = Duration::from_mill
+@@ -31,6 +38,11 @@ pub(super) const TERMINAL_TITLE_SPINNER_INTERVAL: Duration = Duration::from_mill
  
  /// Time between action-required blink phases in the terminal title.
  const TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL: Duration = Duration::from_secs(1);
@@ -793,7 +832,7 @@ index 592dd04..db12c48 100644
  
  /// Prefix shown in the terminal title when the agent is blocked on user input.
  const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX: &str = "[ ! ] Action Required";
-@@ -134,7 +145,9 @@ impl ChatWidget {
+@@ -134,7 +146,9 @@ impl ChatWidget {
      }
  
      fn sync_status_surface_shared_state(&mut self, selections: &StatusSurfaceSelections) {
@@ -804,7 +843,7 @@ index 592dd04..db12c48 100644
              self.status_line_branch = None;
              self.status_line_branch_pending = false;
              self.status_line_branch_lookup_complete = false;
-@@ -160,6 +173,15 @@ impl ChatWidget {
+@@ -160,6 +174,15 @@ impl ChatWidget {
      }
  
      fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
@@ -820,7 +859,7 @@ index 592dd04..db12c48 100644
          let enabled = !selections.status_line_items.is_empty();
          self.bottom_pane.set_status_line_enabled(enabled);
          if !enabled {
-@@ -187,6 +209,142 @@ impl ChatWidget {
+@@ -187,6 +210,166 @@ impl ChatWidget {
          self.set_status_line_hyperlink(hyperlink_url);
      }
  
@@ -909,8 +948,8 @@ index 592dd04..db12c48 100644
 +        let context_used_percent = self.status_line_context_used_percent();
 +        let context_remaining_percent = self.status_line_context_remaining_percent();
 +        let context_window_tokens = self.status_line_context_window_size();
-+        let five_hour_limit = self.status_line_value_for_item(StatusLineItem::FiveHourLimit);
-+        let weekly_limit = self.status_line_value_for_item(StatusLineItem::WeeklyLimit);
++        let five_hour_limit = self.status_line_command_limit_payload(five_hour_status_window);
++        let weekly_limit = self.status_line_command_limit_payload(weekly_status_window);
 +
 +        json!({
 +            "version": 1,
@@ -946,12 +985,8 @@ index 592dd04..db12c48 100644
 +                "total": total_usage.total_tokens,
 +            },
 +            "limits": {
-+                "five_hour": {
-+                    "text": five_hour_limit,
-+                },
-+                "weekly": {
-+                    "text": weekly_limit,
-+                },
++                "five_hour": five_hour_limit,
++                "weekly": weekly_limit,
 +            },
 +            "status": {
 +                "state": self.run_state_status_text(),
@@ -960,10 +995,38 @@ index 592dd04..db12c48 100644
 +        .to_string()
 +    }
 +
++    fn status_line_command_limit_payload(
++        &self,
++        window_for_snapshot: fn(
++            &RateLimitSnapshotDisplay,
++        ) -> Option<(&RateLimitWindowDisplay, bool)>,
++    ) -> serde_json::Value {
++        let Some((window, is_secondary)) = self
++            .rate_limit_snapshots_by_limit_id
++            .get("codex")
++            .and_then(window_for_snapshot)
++        else {
++            return json!({
++                "text": Option::<String>::None,
++                "used_percent": Option::<f64>::None,
++                "remaining_percent": Option::<f64>::None,
++                "resets_at": Option::<String>::None,
++            });
++        };
++        let label = limit_label_for_window(window.window_minutes, is_secondary);
++
++        json!({
++            "text": status_line_limit_display_text(window, &label),
++            "used_percent": window.used_percent,
++            "remaining_percent": status_line_limit_remaining_percent(window),
++            "resets_at": window.resets_at.as_deref(),
++        })
++    }
++
      /// Clears the terminal title Codex most recently wrote, if any.
      ///
      /// This does not attempt to restore the shell or terminal's previous title;
-@@ -996,6 +1154,111 @@ fn matches_window_label(window: &RateLimitWindowDisplay, label: &str) -> bool {
+@@ -996,6 +1179,111 @@ fn matches_window_label(window: &RateLimitWindowDisplay, label: &str) -> bool {
          == Some(label)
  }
  

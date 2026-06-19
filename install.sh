@@ -16,7 +16,7 @@ fi
 
 if [ "$FORCE" != "1" ] && command -v codex >/dev/null 2>&1; then
   codex_bin="$(command -v codex)"
-  if ! strings "$codex_bin" 2>/dev/null | grep -q "status_line_command"; then
+  if ! grep -a -q "status_line_command" "$codex_bin" 2>/dev/null; then
     cat >&2 <<'EOF'
 Error: this Codex binary does not appear to support tui.status_line_command.
 

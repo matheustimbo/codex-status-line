@@ -42,6 +42,20 @@ cyan() { color "36" "$*"; }
 yellow() { color "33" "$*"; }
 magenta() { color "35" "$*"; }
 
+limit_text() {
+  local key="$1"
+  local text reset
+  text="$(json_get ".limits.${key}.text")"
+  reset="$(json_get ".limits.${key}.resets_at")"
+  if [ -n "$text" ] && [ -n "$reset" ]; then
+    case "$text" in
+      *reset*) ;;
+      *) text="${text} (resets ${reset})" ;;
+    esac
+  fi
+  printf '%s' "$text"
+}
+
 SHOW_MODEL="${SHOW_MODEL:-1}"
 SHOW_GIT="${SHOW_GIT:-1}"
 SHOW_CONTEXT="${SHOW_CONTEXT:-1}"
@@ -54,8 +68,8 @@ STATUSLINE_MAX_WIDTH="${STATUSLINE_MAX_WIDTH:-120}"
 model="$(json_get '.model.with_reasoning')"
 branch="$(json_get '.git.branch')"
 context="$(json_get '.context.used_percent')"
-five="$(json_get '.limits.five_hour.text')"
-weekly="$(json_get '.limits.weekly.text')"
+five="$(limit_text 'five_hour')"
+weekly="$(limit_text 'weekly')"
 session="$(json_get '.session.id')"
 
 parts=()
