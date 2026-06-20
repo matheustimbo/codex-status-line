@@ -9,26 +9,8 @@ Current public Codex CLI renders `tui.status_line` as a native one-line list of 
 
 ## Install
 
-1. Apply the patch to Codex source:
-
 ```bash
-git clone https://github.com/openai/codex.git
-cd codex
-git apply /Users/matheustimbo/Documents/codex-status-line/patches/codex-status-line-command.patch
-cd codex-rs
-cargo build -p codex-cli --bin codex --release
-```
-
-2. Put the patched binary first in `PATH`:
-
-```bash
-export PATH="$PWD/target/release:$PATH"
-```
-
-3. Install the status line:
-
-```bash
-bash /Users/matheustimbo/Documents/codex-status-line/install.sh
+curl -fsSL https://raw.githubusercontent.com/matheustimbo/codex-status-line/main/install.sh | bash
 ```
 
 The installer copies `statusline-command.sh` to `~/.codex/statusline-command.sh` and appends:
@@ -41,6 +23,24 @@ timeout_ms = 1000
 ```
 
 It backs up `~/.codex/config.toml` before changing an existing file.
+
+## Prerequisite: patched Codex
+
+Current public Codex CLI must be patched before running the installer:
+
+```bash
+git clone https://github.com/openai/codex.git
+cd codex
+curl -fsSL https://raw.githubusercontent.com/matheustimbo/codex-status-line/main/patches/codex-status-line-command.patch | git apply
+cd codex-rs
+cargo build -p codex-cli --bin codex --release
+```
+
+Put the patched binary first in `PATH`:
+
+```bash
+export PATH="$PWD/target/release:$PATH"
+```
 
 ## Options
 
