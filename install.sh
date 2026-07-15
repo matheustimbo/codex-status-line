@@ -8,22 +8,20 @@ REFRESH_INTERVAL_MS="${STATUSLINE_REFRESH_INTERVAL_MS:-1000}"
 TIMEOUT_MS="${STATUSLINE_TIMEOUT_MS:-1000}"
 FORCE="${CODEX_STATUS_LINE_FORCE:-0}"
 RAW_BASE_URL="${CODEX_STATUS_LINE_RAW_BASE_URL:-https://raw.githubusercontent.com/matheustimbo/codex-status-line/main}"
+NATIVE_ITEMS='["model-with-reasoning", "git-branch", "context-used", "five-hour-limit", "weekly-limit"]'
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Error: python3 is required to safely update config.toml." >&2
   exit 1
 fi
 
-if [ "$FORCE" != "1" ] && command -v codex >/dev/null 2>&1; then
+install_mode="native"
+if [ "$FORCE" = "1" ]; then
+  install_mode="command"
+elif command -v codex >/dev/null 2>&1; then
   codex_bin="$(command -v codex)"
-  if ! grep -a -q "status_line_command" "$codex_bin" 2>/dev/null; then
-    cat >&2 <<'EOF'
-Error: this Codex binary does not appear to support tui.status_line_command.
-
-Apply patches/codex-status-line-command.patch to Codex CLI and install that build first,
-or rerun with CODEX_STATUS_LINE_FORCE=1 if you know your binary is patched.
-EOF
-    exit 1
+  if grep -a -q "status_line_command" "$codex_bin" 2>/dev/null; then
+    install_mode="command"
   fi
 fi
 
@@ -48,7 +46,7 @@ else
 fi
 chmod 755 "$SCRIPT_DEST"
 
-python3 - "$CONFIG_PATH" "$SCRIPT_DEST" "$REFRESH_INTERVAL_MS" "$TIMEOUT_MS" <<'PY'
+python3 - "$CONFIG_PATH" "$SCRIPT_DEST" "$REFRESH_INTERVAL_MS" "$TIMEOUT_MS" "$install_mode" "$NATIVE_ITEMS" <<'PY'
 from __future__ import annotations
 
 import datetime as dt
@@ -68,6 +66,8 @@ config_path = pathlib.Path(sys.argv[1]).expanduser()
 script_path = pathlib.Path(sys.argv[2]).expanduser()
 refresh_interval_ms = int(sys.argv[3])
 timeout_ms = int(sys.argv[4])
+install_mode = sys.argv[5]
+native_items = json.loads(sys.argv[6])
 
 if refresh_interval_ms < 250:
     raise SystemExit("Error: STATUSLINE_REFRESH_INTERVAL_MS must be at least 250.")
@@ -86,6 +86,8 @@ if tomllib is not None:
 lines = old_text.splitlines(keepends=True)
 new_lines: list[str] = []
 skip = False
+in_tui = False
+native_written = False
 for line in lines:
     stripped = line.strip()
     if stripped == "[tui.status_line_command]":
@@ -93,23 +95,51 @@ for line in lines:
         continue
     if skip and stripped.startswith("[") and stripped.endswith("]"):
         skip = False
+    if skip:
+        continue
+
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_tui and install_mode == "native" and not native_written:
+            new_lines.append(f"status_line = {json.dumps(native_items)}\n")
+            native_written = True
+        in_tui = stripped == "[tui]"
+    if in_tui and stripped.startswith("status_line") and "=" in stripped:
+        if install_mode == "native" and not native_written:
+            new_lines.append(f"status_line = {json.dumps(native_items)}\n")
+            native_written = True
+        continue
     if not skip:
         new_lines.append(line)
 
-if new_lines and not new_lines[-1].endswith("\n"):
-    new_lines[-1] += "\n"
-if new_lines and new_lines[-1].strip():
-    new_lines.append("\n")
+if in_tui and install_mode == "native" and not native_written:
+    new_lines.append(f"status_line = {json.dumps(native_items)}\n")
+    native_written = True
 
 command = "bash " + shlex.quote(str(script_path))
-new_lines.extend(
-    [
-        "[tui.status_line_command]\n",
-        f"command = {json.dumps(command)}\n",
-        f"refresh_interval_ms = {refresh_interval_ms}\n",
-        f"timeout_ms = {timeout_ms}\n",
-    ]
-)
+if install_mode == "command":
+    if new_lines and not new_lines[-1].endswith("\n"):
+        new_lines[-1] += "\n"
+    if new_lines and new_lines[-1].strip():
+        new_lines.append("\n")
+    new_lines.extend(
+        [
+            "[tui.status_line_command]\n",
+            f"command = {json.dumps(command)}\n",
+            f"refresh_interval_ms = {refresh_interval_ms}\n",
+            f"timeout_ms = {timeout_ms}\n",
+        ]
+    )
+elif not native_written:
+    if new_lines and not new_lines[-1].endswith("\n"):
+        new_lines[-1] += "\n"
+    if new_lines and new_lines[-1].strip():
+        new_lines.append("\n")
+    new_lines.extend(
+        [
+            "[tui]\n",
+            f"status_line = {json.dumps(native_items)}\n",
+        ]
+    )
 
 new_text = "".join(new_lines)
 if tomllib is not None:
@@ -133,8 +163,11 @@ tmp_path.replace(config_path)
 print(f"Updated {config_path}")
 if backup_path:
     print(f"Backup: {backup_path}")
-print(f"Installed command: {command}")
+if install_mode == "command":
+    print(f"Installed command: {command}")
+else:
+    print("Installed native Codex status line (command renderer not detected).")
 PY
 
 echo
-echo "Done. Restart a patched Codex CLI to see the command-backed status line."
+echo "Done. Restart Codex CLI to see the status line."

@@ -2,7 +2,7 @@
 
 Claude-style status line for Codex CLI.
 
-Current public Codex CLI renders `tui.status_line` as a native one-line list of item IDs. To match Claude Code behavior, this repo ships two pieces:
+The installer works with the public Codex CLI through `tui.status_line`. For Claude Code-style ANSI and multiline output, the repo also provides a renderer for patched builds:
 
 - `patches/codex-status-line-command.patch`: a Codex TUI patch that adds `[tui.status_line_command]`.
 - `statusline-command.sh`: an external renderer that receives JSON on stdin, emits ANSI, and can output multiple lines.
@@ -22,11 +22,18 @@ refresh_interval_ms = 1000
 timeout_ms = 1000
 ```
 
+Without the patch, it automatically configures the official native status line:
+
+```toml
+[tui]
+status_line = ["model-with-reasoning", "git-branch", "context-used", "five-hour-limit", "weekly-limit"]
+```
+
 It backs up `~/.codex/config.toml` before changing an existing file.
 
-## Prerequisite: patched Codex
+## Optional: advanced renderer
 
-Current public Codex CLI must be patched before running the installer:
+To use the external renderer instead of the native status line, patch Codex before running the installer:
 
 ```bash
 git clone https://github.com/openai/codex.git
@@ -64,9 +71,9 @@ Supported options:
 
 Limit items include reset times when Codex has them in the rate-limit snapshot.
 
-## Safety
+## Compatibility
 
-`install.sh` checks whether the local `codex` binary appears to contain `status_line_command` support. If not, it exits before editing config so an unpatched Codex install is not broken.
+`install.sh` checks whether the local `codex` binary contains `status_line_command` support. Otherwise it uses the native configuration supported by the official Codex CLI.
 
 Use `CODEX_STATUS_LINE_FORCE=1 bash install.sh` only when you know your Codex binary is patched.
 
